@@ -1,0 +1,1 @@
+{"request_id": "55bf59cf-d9df-4b0c-a847-b5e002bde95e", "created_at": "2026-10-19T07:39:13.158283+00:00", "status": "success", "stt_ms": 0.0, "reply_ms": 0.03, "tts_ms": 2.37, "total_ms": 2.4, "model_version": "demo/beep", "stt_mode": "데모 STT", "tts_mode": "비프음 데모", "audio_sha256": "0d1d5fefbbade0c2fca82a2de31505afd13835400c988839cd2fe1123b4399c0"}

@@ -1,18 +1,21 @@
-# day37_logic.py
+# day37_practice_logic.py
 # WAV 파일을 이용한 STT > 응답 생성 > TTS 파이프라인
 
 import asyncio # 비동기 TTS 함수를 실행
 import hashlib # 원본 음성의 SHA-256 해시값 계산
+import io # WAV 데이터를 메모리 파일처럼 처리
+import math # 비프음의 파형 계산
+import struct # 비프음 샘플을 바이너리로 변환
 import tempfile # STT 입력을 위한 임시 WAV 파일 생성
 import time # 처리 단계별 실행 시간 측정
 import uuid # 요청별 고유 ID 생성
 import wave # WAV 파일 헤더와 PCM 형식 검사
 from datetime import datetime, timezone # UTC 시각 생성
 from pathlib import Path # 파일 경로 처리
-import streamlit as st # 웹 기반 사용자 인터페이스
+import streamlit as st # Whisper 모델 캐시
 
 from day37_db import store_meta
-
+from day37_data import FACILITIES
 
 # 입력 파일 최대 크기를 10Mbytes로 제한
 MAX_BYTES = 10 * 1024 * 1024
@@ -23,17 +26,8 @@ MODEL_SIZE = 'base'
 # Edge TTS에서 사용하는 한국어 여성 음성 모델 ID
 VOICE_ID = 'ko-KR-SunHiNeural'
 
-FACILITIES = {
-    "도서관": "도서관은 본관 옆 건물이며 평일 9시부터 18시까지 운영합니다.",
-    "학생식당": "학생식당은 학생회관 1층에 있으며 11시부터 14시까지 운영합니다.",
-    "취업지원센터": "취업지원센터는 학생회관 2층이며 취업 상담을 제공합니다.",
-    "행정실": "행정실은 본관 1층이며 각종 증명서 발급을 안내합니다.",
-}
-
 # WAV 파일 확인 후 음성 파일 정보 추출 함수
 def validate_wav(audio):
-    import io # WAV 데이터를 메모리 파일 처럼 읽기위함
-
     try:
         with wave.open(io.BytesIO(audio), 'rb') as wav:
             channels = wav.getnchannels()
@@ -41,11 +35,10 @@ def validate_wav(audio):
             sample_width = wav.getsampwidth()
             frames = wav.getnframes()
             compression = wav.getcomptype()
-
     except (wave.Error, EOFError, OSError) as e:
         raise ValueError('유효한 비압축 PCM WAV 파일을 입력해 주세요.') from e
 
-    if compression != 'NONE' or channels not in (1, 2) or sample_rate <= 0 or frames <= 0:
+    if compression != 'NONE' or channels not in (1, 2) or sample_rate <= 0 or sample_width <= 0 or frames <= 0:
         raise ValueError('모노/스테레오 비압축 PCM WAV 파일이 필요합니다.')
 
     return {
@@ -78,9 +71,7 @@ def transcribe_wav(audio, model_size):
             language='ko',
             vad_filter=True,
         )
-
-        transcript = ''.join(segment.text.strip() for segment in segments).strip()
-
+        transcript = ' '.join(segment.text.strip() for segment in segments).strip()
         return transcript
 
     finally: # 파일 제거
@@ -89,23 +80,25 @@ def transcribe_wav(audio, model_size):
 
 # 인식한 문장 정리후 응답 문장 생성 함수
 def build_reply(transcript):
-    clean = ''.join(transcript.split())
+    clean = ' '.join(transcript.split())
     if not clean:
         return '음성 인식 불가 다시 시도하세요.'
-    return f'방금 내용은 "{clean}" 입니다!'
+
+    for facility_name, description in FACILITIES.items():
+        if facility_name in clean:
+            return description
+
+    return f"안내 가능한 시설은 {', '.join(FACILITIES.keys())}입니다."
 
 
 # tts mp3로 만들어 저장하는 함수
 async def generate_tts_mp3(text, voice):
     import edge_tts
-
     with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
         mp3_path = Path(f.name)
-
     try: # 저장부분
         await edge_tts.Communicate(text=text, voice=voice).save(str(mp3_path))
         return mp3_path.read_bytes()
-
     finally: # 임시 파일 지우기
         mp3_path.unlink(missing_ok=True)
 
@@ -113,11 +106,32 @@ async def generate_tts_mp3(text, voice):
 # 함수를 동기 코드에서 실행하는 코드
 def synthesize_speech(text, voice_id):
     mp3_bytes = asyncio.run(generate_tts_mp3(text, voice_id))
-    return mp3_bytes, 'audio/mp3'
+    return mp3_bytes, 'audio/mpeg'
+
+
+# 비프음 데모 TTS (실제 문장을 읽는 대신 짧은 비프음 생성)
+def generate_beep_wav():
+    sample_rate = 16000
+    duration = 0.4
+    frequency = 660
+    audio_bytes = bytearray()
+
+    for sample_num in range(int(sample_rate * duration)):
+        sample = int(12000 * math.sin(2 * math.pi * frequency * sample_num / sample_rate))
+        audio_bytes.extend(struct.pack('<h', sample))
+
+    output = io.BytesIO()
+    with wave.open(output, 'wb') as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(bytes(audio_bytes))
+
+    return output.getvalue(), 'audio/wav'
 
 
 # WAV 검증 > STT > 응답 생성 > TTS > 로그 저장 과정을 연결해서 실행하는 파이프라인 함수
-def run_pipeline(audio, model_size, voice_id):
+def run_pipeline(audio, model_size, voice_id, stt_mode='실제 faster-whisper', tts_mode='실제 edge-tts', demo_text=''):
 
     # 요청을 구분할 고유 요청 ID
     request_id = str(uuid.uuid4())
@@ -135,10 +149,12 @@ def run_pipeline(audio, model_size, voice_id):
     error = None # 실패한 경우 예외 저장
 
     try:
-
         # STT 단계 실행 후 소요시간 측정
         t0 = time.perf_counter()
-        transcript = transcribe_wav(audio, model_size)
+        if stt_mode == '데모 STT':
+            transcript = demo_text.strip()
+        else:
+            transcript = transcribe_wav(audio, model_size)
         marks['stt_ms'] = (time.perf_counter() - t0) * 1000
 
         # 규칙 기반 응답 생성 단계 실행 후 소요시간 측정
@@ -148,7 +164,10 @@ def run_pipeline(audio, model_size, voice_id):
 
         # 실제 TTS 음성 합성 단계 실행 후 소요시간 측정
         t0 = time.perf_counter()
-        output, mime = synthesize_speech(reply, voice_id)
+        if tts_mode == '비프음 데모':
+            output, mime = generate_beep_wav()
+        else:
+            output, mime = synthesize_speech(reply, voice_id)
         marks['tts_ms'] = (time.perf_counter() - t0) * 1000
 
         # UI에서 사용할 성공 결과를 튜플로 저장
@@ -166,10 +185,14 @@ def run_pipeline(audio, model_size, voice_id):
         'status': 'error' if error else 'success',
         **{key: round(value, 2) for key, value in marks.items()},
         'total_ms': round(elapsed, 2),
-        'model_version': f'whisper-{model_size}/edge-tts/{voice_id}',
+        'model_version': f"{'demo' if stt_mode == '데모 STT' else 'whisper-' + model_size}/{'beep' if tts_mode == '비프음 데모' else 'edge-tts/' + voice_id}",
+        'stt_mode': stt_mode,
+        'tts_mode': tts_mode,
         'audio_sha256': digest
     }
 
-    store_meta(meta)
+    db_warning = store_meta(meta)
+    if db_warning:
+        meta['db_warning'] = db_warning
 
     return result, marks, meta, error
